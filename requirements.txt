@@ -1,0 +1,16 @@
+accelerate==1.12.0
+autoawq==0.2.9
+datasets==4.4.1
+latex2sympy2_extended==1.10.2
+math_verify==0.8.0
+numpy==2.4.0
+packaging==25.0
+pandas==2.3.3
+peft==0.18.0
+scikit_learn==1.8.0
+sentence_transformers==5.1.2
+torch==2.8.0
+tqdm==4.67.1
+transformers==4.57.3
+trl==0.25.1
+vllm==0.10.2
