@@ -1,5 +1,5 @@
 import torch
-from typing import List, Dict, Any, Callable, Optional
+from typing import List, Dict, Any, Callable, Optional, Tuple, Union
 import logging
 import numpy as np
 import sys
@@ -16,6 +16,9 @@ shuffle_sequence_dict,
 split_tensor_dict,
 unsplit_pixel_values_by_grid,
 )
+from peft import LoraConfig, get_peft_model
+import os
+import re
 #from trl.chat_template_utils import add_response_schema, get_training_chat_template, parse_response
 import transformers
 from packaging.version import Version
@@ -40,12 +43,8 @@ from transformers import (
     is_trackio_available,
     is_wandb_available,
 )
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 
-peft_config = LoraConfig(
-    r=1,
-    lora_alpha=32,
-    target_modules="all-linear"
-)
 from trl.import_utils import is_math_verify_available
 
 
@@ -53,67 +52,112 @@ if is_math_verify_available():
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
 
-def reasoning_accuracy_reward(
-    completions: list[list[dict[str, str]]],
-    solution: list[str],
-    reasoning_delimiters: list[str] | None = None,
-    **kwargs,
-) -> list[float | None]:
-   
-    if not is_math_verify_available():
-        raise ImportError("Please install the `math_verify` package to use reasoning_accuracy_reward")
 
-    if reasoning_delimiters is None:
-        # Use sensible defaults for majority of reasoning models
-        reasoning_delimiters = ["</think>"]
+def extract_answer_from_content(content: str) -> str:
+    """
+    Извлекает ответ из контента модели.
+    
+    Args:
+        content: Текст ответа модели, может содержать теги <answer>
+    
+    Returns:
+        Извлеченный ответ (очищенный текст)
+    """
+    if not content:
+        return ""
+    
+    # 1. Пытаемся извлечь содержимое тега <answer>
+    
+    answer_patterns = [
+        r'<answer>(.*?)</answer>',  # с тегами
+        r'answer is ([A-E])',       # "answer is B"
+        r'answer: ([A-E])',         # "answer: B"
+        r'Answer: ([A-E])',         # "Answer: B"
+        r'Ответ: ([A-E])',          # "Ответ: B"
+        r'correct answer is ([A-E])', # "correct answer is B"
+        r'правильный ответ ([A-E])'  # "правильный ответ B"
+    ]
+    
+    for pattern in answer_patterns:
+        match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+    
+        if match:
+            extracted = match.group(1).strip()  
+            if extracted in ['A', 'B', 'C', 'D', 'E']:
+                return extracted
+    
+    # 2. Если не нашли по паттернам, ищем одиночную букву A-E
+    letter_match = re.search(r'\b([A-E])\b', content, re.IGNORECASE)
+    if letter_match:
+        if letter_match in ['A', 'B', 'C', 'D', 'E']:
+            return letter_match
+        return letter_match.group(1).upper()
+    
+    # 3. Возвращаем очищенный текст (убираем теги)
+    cleaned = re.sub(r'<[^>]+>', '', content).strip()
 
-    rewards = []
-    #print(len(completions))
-    if len(completions) > 1:
-        contents = [completion[0]["content"] for completion in completions]
+    return cleaned
 
-    else:
-        
-        #solution = [solution]
-        contents = completions
+def normalize_answer(answer: str) -> str:
+    """
+    Нормализует ответ для сравнения.
+    
+    Args:
+        answer: Ответ (модели или ground truth)
+    
+    Returns:
+        Нормализованный ответ
+    """
+    if not answer:
+        return ""
+    
+    # Приводим к верхнему регистру
+    answer = str(answer).upper().strip()
+    
+    # Убираем лишние пробелы
+    answer = re.sub(r'\s+', ' ', answer)
+    
+    # Если ответ содержит несколько вариантов через запятую, берем первый
+    if ',' in answer:
+        parts = [p.strip() for p in answer.split(',')]
+        return parts[0]
+    
+    return answer
 
-    for content, sol in zip(contents, solution, strict=True):
-        # Split final answer from reasoning content
-        is_reasoning_complete = False
-        for delim in reasoning_delimiters:
-            if delim in content:
-                content = content.split(delim)[-1]
-                is_reasoning_complete = True
-                break
-        if not is_reasoning_complete:
-            # We assign zero reward instead of `None` to penalize incomplete reasoning
-            rewards.append(0.0)
-            continue
+def reward_function(
+    content: str,
+    ground_truth: str,
+    only_reward: bool,
+) -> Tuple[float, str, str]:
+    """
+    Вычисляет награду за ответ модели.
+    
+    Args:
+        content: Ответ модели (может содержать теги)
+        ground_truth: Правильный ответ
 
-        gold_parsed = parse(sol)
-        if len(gold_parsed) != 0:
-            # We require the answer to be provided in correct latex (no malformed operators)
-            answer_parsed = parse(
-                content,
-                extraction_config=[
-                    LatexExtractionConfig(
-                        boxed_match_priority=0,
-                        normalization_config=NormalizationConfig(
-                            units=True,
-                        ),
-                        try_extract_without_anchor=False,
-                    )
-                ],
-                extraction_mode="first_match",
-            )
-            reward = float(verify(gold_parsed, answer_parsed))
-        else:
-            
-            reward = 0.0
-        rewards.append(reward)
+    Returns:
+        Tuple: (reward, extracted_answer, matched_part)
+    """
+    
+    # 1. Извлекаем ответ из контента модели
+    extracted_answer = extract_answer_from_content(content)
 
-    return rewards
-
+    # 2. Нормализуем оба ответа
+    normalized_model_answer = normalize_answer(extracted_answer)
+    normalized_ground_truth = normalize_answer(ground_truth)
+    
+    # 3. Проверяем точное совпадение для буквенных ответов
+    if normalized_ground_truth in ['A', 'B', 'C', 'D', 'E']:
+        # Для буквенных ответов всегда используем точное совпадение
+        is_correct = (normalized_model_answer == normalized_ground_truth)
+        reward = 1.0 if is_correct else 0.0
+        if only_reward:
+            return reward
+        return reward, extracted_answer, normalized_model_answer
+    if only_reward:
+        return 0.0
+    return 0.0, extracted_answer, normalized_model_answer
 
 
 class R3GRPOTrainer(GRPOTrainer):
@@ -129,14 +173,13 @@ class R3GRPOTrainer(GRPOTrainer):
         self,
         *args,
         prompts: Optional[Callable] = None,
-        verifier_func: Optional[Callable] = None,
         **kwargs
     ):
         super().__init__(*args, **kwargs)
         
         # Функции для R³ процесса
         self.second_step_func = self._default_second_step
-        self.verifier_func = verifier_func
+        
         
         # Кэш для second_step результатов
         self._second_step_cache = {}
@@ -150,12 +193,13 @@ class R3GRPOTrainer(GRPOTrainer):
         
         # Настройки генерации для второго шага
         self.second_step_generation_config = {
-            'max_new_tokens': 256,
-            'temperature': 0.3,
-            'top_p': 0.9,
+            'max_new_tokens': 400,
+            'temperature': 0.6,
+            'top_p': 0.95,
             'do_sample': True,
             'pad_token_id': self.processing_class.pad_token_id,
-            'eos_token_id': self.processing_class.eos_token_id
+            'eos_token_id': self.processing_class.eos_token_id,
+            'bos_token_id': self.processing_class.bos_token_id
         }
         
         # Флаг для отслеживания первого прохода
@@ -187,7 +231,7 @@ class R3GRPOTrainer(GRPOTrainer):
         
         # Если не нашли, возвращаем первые 200 символов промпта
         return reflection_prompt[:200] + "..." if len(reflection_prompt) > 200 else reflection_prompt
-    
+
     def _decode_completions(self, completion_ids: torch.Tensor) -> List[str]:
         """
         Декодирует completion_ids в текстовые completions.
@@ -229,31 +273,29 @@ class R3GRPOTrainer(GRPOTrainer):
         Генерирует финальный ответ на основе оригинального запроса и самоанализа.
         """
         # Создаем промпт для генерации финального ответа
-        answer_prompt = f"""Based on the following reflection, provide the correct answer to the original query.
+        answer_prompt = f"""Основываясь на приведенных ниже выводах, дайте правильный ответ на исходный запрос.
 
-Original Query: {original_query}
+Исходный запрос: {original_query}
 
-Reflection on previous attempt: {reflection}
+Размышления о предыдущей попытке: {reflection}
 
-Now provide the correct answer:
-
-Answer:"""
+Теперь дайте правильный ответ из предоженных вариантов: A, B, C, D
+"""
         
         # Используем предоставленную модель или self.model
-        if model is None:
-            model = self.model
-        
+
         # Генерация финального ответа (вне графа вычислений)
+        self.model.eval()
+        self.model.gradient_checkpointing_disable()
+        self.model.config.use_cache = True
         with torch.no_grad():
             inputs = self.processing_class(
                 answer_prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=2048
+                return_tensors="pt"
             ).to(self.accelerator.device)
             
             # Генерация ответа
-            generated_ids = model.generate(
+            generated_ids = self.model.generate(
                 **inputs,
                 max_new_tokens=self.second_step_generation_config['max_new_tokens'],
                 temperature=self.second_step_generation_config['temperature'],
@@ -262,13 +304,14 @@ Answer:"""
                 pad_token_id=self.second_step_generation_config['pad_token_id'],
                 eos_token_id=self.second_step_generation_config['eos_token_id']
             )
-            
             # Декодирование ответа
-            final_answer = self.processing_class.decode(
-                generated_ids[0][inputs['input_ids'].shape[1]:],
-                skip_special_tokens=True
-            ).strip()
+            output_ids = generated_ids[0][len(inputs.input_ids[0]):].tolist() 
+            final_answer = self.processing_class.decode(output_ids, skip_special_tokens=True).strip("\n")
         
+        self.model.train()
+        self.model.gradient_checkpointing_enable()
+        self.model.config.use_cache = False
+
         return final_answer
     
     def _execute_second_step_for_batch(
@@ -297,20 +340,22 @@ Answer:"""
             # Ключ для кэширования
             cache_key = f"{hash(original_query)}_{hash(completion_text)}"
             solution = solutions[i]
+
             if cache_key in self._second_step_cache:
                 reward = self._second_step_cache[cache_key]
             else:
                 try:
                     # Извлекаем чистый самоанализ из completion
+                   
                     reflection = self._extract_reflection_from_completion(completion_text)
-               
+                   
                     # Генерация финального ответа
                     final_answer = self.second_step_func(original_query, reflection, model)
-                  
+                    #print(final_answer)
                     # Верификация финального ответа
-                    #print(final_answer, original_query)
-                    reward = self.verifier_func([final_answer], solution)[0]
-                  
+                   
+                    reward = reward_function(final_answer, solution, True)
+                    #print(reward, solution)
                     # Кэширование результата
                     self._second_step_cache[cache_key] = reward
                    
@@ -479,15 +524,16 @@ Answer:"""
                 
                 # Вызываем родительский метод для генерации самоанализов
                 # generation_batch - это список словарей с промптами
+               
                 reflection_output = super()._generate_and_score_completions(generation_batch)
-          
+            
                 # Извлекаем сгенерированные completion_ids (токены самоанализов)
                 completion_ids = reflection_output.get('completion_ids')
                 if completion_ids is None:
                     raise ValueError("Could not extract completion_ids from reflection_output")
                 
                 # Извлекаем промпты и ответы из generation_batch
-                
+              
                 prompts = [item.get('prompt', '') for item in generation_batch]
                 solutions = [item.get('solution', '') for item in generation_batch]
                 # ============================================================
@@ -496,7 +542,7 @@ Answer:"""
                 
                 # Извлекаем оригинальные запросы из промптов
                 #print(solutions)
-                original_queries = [prompt[0]['content'] for prompt in prompts]
+                original_queries = [item.get('original_query', '') for item in generation_batch]
                 
                 # Важно: num_generations определяет, сколько самоанализов генерируется на каждый промпт
                 # В reflection_output completion_ids имеет размер [batch_size * num_generations, seq_len]
@@ -513,6 +559,7 @@ Answer:"""
                     solutions, 
                     model=self.model
                 )
+                
                 # ============================================================
                 # ШАГ 3: RL POLICY UPDATE PREPARATION
                 # ============================================================
@@ -579,14 +626,23 @@ Answer:"""
         
         return inputs
 
-
+def custom_reward(
+    completions: list[list[dict[str, str]]],
+    solution: list[str],
+    **kwargs
+) -> list[float | None]:
+    rewards = []
+    contents = [completion[0]["content"] for completion in completions]
+    for content, sol in zip(contents, solution, strict=True):
+        rewards.append(reward_function(content, sol, True))
+    return rewards
 # Пример создания task-specific верификатора для математических задач
 def create_verifier() -> Callable:
     """
     Создает верификатор для наших задач.
     """
 
-    return reasoning_accuracy_reward
+    return custom_reward
 
 # Пример использования
 if __name__ == "__main__":
@@ -598,15 +654,26 @@ if __name__ == "__main__":
     model_name = sys.argv[2]
 
     dataset = load_dataset("json", data_files = file_path, split="train")
-
+    
     model = AutoModelForCausalLM.from_pretrained(model_name)
+    
+
+    lora_config = LoraConfig(
+        task_type="CAUSAL_LM",
+        r=8,
+        lora_alpha=32,
+        lora_dropout=0.1,
+        target_modules=["q_proj", "v_proj"],
+    )
+
+    model = get_peft_model(model, lora_config)
+
+    
+
     tokenizer = AutoTokenizer.from_pretrained(model_name)
-    tokenizer.pad_token = tokenizer.eos_token
-    
-    # Создаем верификатор для математических задач
-    verifier = create_verifier()
-    
-    # Конфигурация GRPO с параметрами из статьи
+    model.config.pad_token_id = tokenizer.pad_token_id
+    model.config.eos_token_id = tokenizer.eos_token_id
+    model.config.bos_token_id = tokenizer.bos_token_id
     training_args = GRPOConfig(
         learning_rate=5e-6,
         adam_beta1 = 0.9,
@@ -619,14 +686,17 @@ if __name__ == "__main__":
         per_device_train_batch_size=1,
         gradient_accumulation_steps=4,
         num_generations=4,
-        max_prompt_length=256,
-        max_completion_length=200,
+        max_prompt_length=2000,
+        max_completion_length=2000,
         num_train_epochs=1,
         save_steps=100,
         max_grad_norm=0.1,
+        use_vllm=False,
+        vllm_mode="colocate",
         log_on_each_node=False,
         vllm_gpu_memory_utilization=.3,
-        report_to="none" #I'm disabling Wandb.
+        output_dir="outputs/Qwen3-1.7B_R3",
+        report_to="none" 
     )
 
     
@@ -635,9 +705,8 @@ if __name__ == "__main__":
         model=model,
         args=training_args,
         train_dataset=dataset,
-        verifier_func=verifier,
-        peft_config=peft_config,
-        reward_funcs=reasoning_accuracy_reward
+        processing_class = tokenizer,
+        reward_funcs=custom_reward
     )
     
     # Запуск тренировки
