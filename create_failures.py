@@ -12,11 +12,13 @@ from datasets import Dataset, concatenate_datasets
 import data_processed
 import sys
 import os
+import re
 from trl.import_utils import is_math_verify_available
 from sentence_transformers import SentenceTransformer
-#model_judge = SentenceTransformer('all-MiniLM-L6-v2')
+from typing import Tuple, Union, Optional
 
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+
 if is_math_verify_available():
     from latex2sympy2_extended import NormalizationConfig
     from math_verify import LatexExtractionConfig, parse, verify
@@ -65,8 +67,9 @@ class FailureDatasetCreator:
     def generate_responses(
         self,
         prompts: List[str],
+        solutions: List[str],
         num_responses_per_prompt: int = 64,
-        max_tokens: int = 512,
+        max_tokens: int = 2000,
         temperature: float = 0.7,
         top_p: float = 0.9
     ) -> Dict[str, List[List[str]]]:
@@ -92,19 +95,18 @@ class FailureDatasetCreator:
             
             # Генерация ответов
             outputs = self.llm.generate(repeated_prompts, sampling_params)
-            
             # Группируем ответы по промптам
             for i, prompt in enumerate(prompts):
                 start_idx = i * num_responses_per_prompt
                 end_idx = start_idx + num_responses_per_prompt
                 prompt_responses = []
-                
+                solution = solutions[i]
                 for j in range(start_idx, end_idx):
                     if j < len(outputs):
                         response = outputs[j].outputs[0].text
                         prompt_responses.append(response)
                 
-                all_responses[prompt] = prompt_responses
+                all_responses[tuple([prompt, solution])] = prompt_responses
                 
         else:
             # Стандартная генерация с помощью transformers
@@ -141,63 +143,116 @@ class FailureDatasetCreator:
         
         return all_responses
 
-    def check_answer(self, response, answer):
-        reasoning_delimiters = ["</think>"]
-        return True if self.reasoning_accuracy_reward(response, [answer], reasoning_delimiters=reasoning_delimiters) == 1.0 else False
+    def extract_answer_from_content(self, content: str) -> str:
+        """
+        Извлекает ответ из контента модели.
+        
+        Args:
+            content: Текст ответа модели, может содержать теги <answer>
+        
+        Returns:
+            Извлеченный ответ (очищенный текст)
+        """
+        if not content:
+            return ""
+        
+        # 1. Пытаемся извлечь содержимое тега <answer>
+        
+        answer_patterns = [
+            r'<answer>(.*?)</answer>',  # с тегами
+            r'answer is ([A-E])',       # "answer is B"
+            r'answer: ([A-E])',         # "answer: B"
+            r'Answer: ([A-E])',         # "Answer: B"
+            r'Ответ: ([A-E])',          # "Ответ: B"
+            r'correct answer is ([A-E])', # "correct answer is B"
+            r'правильный ответ ([A-E])'  # "правильный ответ B"
+        ]
+        
+        for pattern in answer_patterns:
+            match = re.search(pattern, content, re.IGNORECASE | re.DOTALL)
+        
+            if match:
+                extracted = match.group(1).strip()  
+                if extracted in ['A', 'B', 'C', 'D', 'E']:
+                    return extracted
+        
+        # 2. Если не нашли по паттернам, ищем одиночную букву A-E
+        letter_match = re.search(r'\b([A-E])\b', content, re.IGNORECASE)
+        if letter_match:
+            if letter_match in ['A', 'B', 'C', 'D', 'E']:
+                return letter_match
+            return letter_match.group(1).upper()
+        
+        # 3. Возвращаем очищенный текст (убираем теги)
+        cleaned = re.sub(r'<[^>]+>', '', content).strip()
 
-    def reasoning_accuracy_reward(
+        return cleaned
+
+    def normalize_answer(self, answer: str) -> str:
+        """
+        Нормализует ответ для сравнения.
+        
+        Args:
+            answer: Ответ (модели или ground truth)
+        
+        Returns:
+            Нормализованный ответ
+        """
+        if not answer:
+            return ""
+        
+        # Приводим к верхнему регистру
+        answer = str(answer).upper().strip()
+        
+        # Убираем лишние пробелы
+        answer = re.sub(r'\s+', ' ', answer)
+        
+        # Если ответ содержит несколько вариантов через запятую, берем первый
+        if ',' in answer:
+            parts = [p.strip() for p in answer.split(',')]
+            return parts[0]
+        
+        return answer
+
+    def reward_function(
         self,
-        completions: list[list[dict[str, str]]],
-        solution: list[str],
-        reasoning_delimiters: list[str] | None = None,
-        **kwargs,
-    ) -> list[float | None]:
+        content: str,
+        ground_truth: str,
+        only_reward: bool,
+    ) -> Tuple[float, str, str]:
+        """
+        Вычисляет награду за ответ модели.
+        
+        Args:
+            content: Ответ модели (может содержать теги)
+            ground_truth: Правильный ответ
 
-        if not is_math_verify_available():
-            raise ImportError("Please install the `math_verify` package to use reasoning_accuracy_reward")
+        Returns:
+            Tuple: (reward, extracted_answer, matched_part)
+        """
+        
+        # 1. Извлекаем ответ из контента модели
+        extracted_answer = self.extract_answer_from_content(content)
 
-        if reasoning_delimiters is None:
-            # Use sensible defaults for majority of reasoning models
-            reasoning_delimiters = ["</think>"]
+        # 2. Нормализуем оба ответа
+        normalized_model_answer = self.normalize_answer(extracted_answer)
+        normalized_ground_truth = self.normalize_answer(ground_truth)
+        
+        # 3. Проверяем точное совпадение для буквенных ответов
+        if normalized_ground_truth in ['A', 'B', 'C', 'D', 'E']:
+            # Для буквенных ответов всегда используем точное совпадение
+            is_correct = (normalized_model_answer == normalized_ground_truth)
+            reward = 1.0 if is_correct else 0.0
+            if only_reward:
+                return reward
+            return reward, extracted_answer, normalized_model_answer
+        if only_reward:
+            return 0.0
+        return 0.0, extracted_answer, normalized_model_answer
 
-        rewards = []
-        contents = [completions]
-        for content, sol in zip(contents, solution, strict=True):
-            # Split final answer from reasoning content
-            is_reasoning_complete = False
-            for delim in reasoning_delimiters:
-                if delim in content:
-                    content = content.split(delim)[-1]
-                    is_reasoning_complete = True
-                    break
-            if not is_reasoning_complete:
-                # We assign zero reward instead of `None` to penalize incomplete reasoning
-                rewards.append(0.0)
-                continue
+    def check_answer(self, response, answer):
+        return True if self.reward_function(response, answer, True) == 1.0 else False
 
-            gold_parsed = parse(sol)
-            if len(gold_parsed) != 0:
-                # We require the answer to be provided in correct latex (no malformed operators)
-                answer_parsed = parse(
-                    content,
-                    extraction_config=[
-                        LatexExtractionConfig(
-                            boxed_match_priority=0,
-                            normalization_config=NormalizationConfig(
-                                units=True,
-                            ),
-                            try_extract_without_anchor=False,
-                        )
-                    ],
-                    extraction_mode="first_match",
-                )
-                reward = float(verify(gold_parsed, answer_parsed))
-            else:
-                # If the gold solution cannot be parsed, we assign `None` to skip this example
-                reward = 0
-            rewards.append(reward)
-
-        return rewards
 
     def verify_responses(
         self,
@@ -211,23 +266,21 @@ class FailureDatasetCreator:
         i = 0
         for key in all_responses.keys():
             prompt_responses = all_responses[key]
+            _, solution = key
             correctness_flags = []
             for response in prompt_responses:
-                is_correct = self.check_answer(response, original_dataset['solution'][i])
-                
+                #match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
+                #if match:
+                 #   response = match.group(1).strip()
+                   # if len(ans) >= 1:
+                        #response = ans
+                is_correct = self.check_answer(response, solution)
                 correctness_flags.append(is_correct)
             
             verification_results[key] = correctness_flags
             i += 1
         
         return verification_results
-    
-    def semantic_similarity(self, response, answer):
-        treshold = 0.9
-        embedding_res = model_judge.encode(response)
-        embedding_ans = model_judge.encode(answer)
-        print('RESPONSE',response,'/n', 'ANSWER', answer, '/n', cosine_similarity([embedding_res], [embedding_ans]))
-        return True if cosine_similarity([embedding_res], [embedding_ans]) >= treshold else False
     
     def create_failure_dataset(
         self,
@@ -240,14 +293,15 @@ class FailureDatasetCreator:
         """
         # Извлекаем промпты
         prompts = original_dataset[prompt_column]
-        
+        solutions = original_dataset["solution"]
         logging.info(f"Processing {len(prompts)} prompts...")
         # Генерируем ответы для каждого промпта
         all_responses = self.generate_responses(
             prompts, 
+            solutions,
             num_responses_per_prompt=num_responses_per_prompt
         )
-    
+        
         # Проверяем ответы
         verification_results = self.verify_responses(
             original_dataset, 
@@ -255,19 +309,24 @@ class FailureDatasetCreator:
         )
         # Собираем датасет ошибок
         failure_data = []
-        
-        for i, prompt in enumerate(prompts):
-            responses = all_responses.get(prompt, [])
-            correctness = verification_results.get(prompt, [])
+        for i, (prompt, solution) in enumerate(zip(prompts, solutions)):
+            responses = all_responses.get(tuple([prompt,solution]), [])
+            correctness = verification_results.get(tuple([prompt,solution]), [])
 
             for j, (response, is_correct) in enumerate(zip(responses, correctness)):
                     if not is_correct:  
-                        new_prompt = f"""Вы — высококвалифицированный аналитик, перед которым поставлена задача провести углубленный анализ ошибки в ответе. Ваша задача - понять, почему ответ неверен.:
-                        {response} был сгенерирован, несмотря на первоначальный запрос: {prompt}.
-        Проанализируйте свои действия и разработайте план по улучшению будущих ответов."""
+                        match = re.search(r'<answer>(.*?)</answer>', response, re.DOTALL)
+                        if match:
+                            response = match.group(1).strip()
+                        new_prompt = f"""Вы — высококвалифицированный аналитик, перед которым поставлена задача провести 
+                        углубленный анализ ошибки в ответе. Ваша задача - понять, почему твой прошлый ответ оказался неверен:{response}. 
+                        Первоначальный запрос: {prompt}.
+                        Проанализируйте свои действия и разработайте план по улучшению будущих ответов. В ходе размышлений 
+                        необходимо учесть тот факт, что нельзя выбрать сразу несколько вариантов ответов"""
                         failure_data.append({
                             "prompt": new_prompt,
-                            "solution": original_dataset['solution'][i]
+                            "solution": solution,
+                            "original_query": prompt
                         })
                         
         logging.info(f"Created failure dataset with {len(failure_data)} samples")
@@ -278,6 +337,7 @@ class FailureDatasetCreator:
                                     {"role": "user", "content": x['prompt']}
                                     ],
                                     "solution": x["solution"],
+                                    "original_query": x["original_query"]
                                 })
         return dataset
     
@@ -300,4 +360,4 @@ if __name__ == "__main__":
     )
     failure_dataset = failure_dataset.to_pandas()
 
-    failure_dataset.to_json("failures_dataset.json",  orient='records', lines=False, force_ascii=False, indent=4)
+    failure_dataset.to_json("failures_dataset.json",  orient='records', lines=False, force_ascii=False, indent=5)
