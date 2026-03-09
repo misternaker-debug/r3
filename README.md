@@ -23,9 +23,8 @@ GRPO R³ — это модификация GRPO для улучшения язы
 - `file_path` — путь до датасета.
 - `model_name` — модель.
 - `num_responses_per_prompt` — количество сгенерированных ответов на одну задачу.
----
 Пример скрипта для генерации датасета: `python src/create_failures.py data.json Qwen/Qwen3-1.7B 64`
-
+---
 Аргументы:
 - `file_path` — путь до датасета.
 - `model_name` — модель.
