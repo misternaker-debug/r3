@@ -28,6 +28,7 @@ GRPO R³ — это модификация GRPO для улучшения язы
 Пример скрипта для генерации датасета: 
 `python src/create_failures.py data.json Qwen/Qwen3-1.7B 64`
 
+
 ---
 Аргументы:
 - `file_path` — путь до датасета.
